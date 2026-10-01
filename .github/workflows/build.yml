@@ -171,7 +171,7 @@ jobs:
           exit 1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # The three engines build one after the other in the same builder, so the
       # second and third reuse the common stage of the first. The builder is new
@@ -255,7 +255,7 @@ jobs:
           exit 1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # The base digest goes onto the index as an annotation. The plan job of the
       # 4-hourly run reads it back to decide whether the base changed.
