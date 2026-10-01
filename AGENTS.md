@@ -46,25 +46,24 @@ server, and the secrets reach the container at run time. The image is public.
   Redis. The control plane also treats a custom Dockerfile `FROM` this image as one with the
   extension (`MahoDefaultConfig::usesPhpImage()`).
 - **The base stays Debian 13 (trixie).** The Chromium package names are Debian 13's (`t64`).
-- **No layer cache in the workflow.** `apt-get upgrade` exists to bring Debian security updates,
-  and a cache would keep the old layer. The builder is new in every job and exports no cache. The
-  three engine builds of one job share that builder, which is how they share the `common` stage.
+- **The build cache is what keeps deploys from downloading the image again.** See **Build cache**.
+  Do not remove `--cache-from`/`--cache-to` or the `REFRESH` argument.
 - **A tag moves only after both platforms built and passed the test.** The merge job refuses a set
   with fewer than two digests for an engine, so a failure leaves the tag on the last good image.
 - **The base is pinned by digest at build time.** The plan job resolves
   `dunglas/frankenphp:1-php<v>-trixie` to a digest and passes `BASE_IMAGE=<tag>@<digest>`. The merge
-  job writes the digest onto the index as the annotation `org.opencontainers.image.base.digest`.
-  The 4-hourly run reads it back to decide whether the base changed. Keep the two in step.
+  job writes the digest onto the index as the annotation `org.opencontainers.image.base.digest`,
+  for inspection. Nothing reads it back.
 - The Node, Chromium and Mesa stub recipe is the same as in `MahoCommerce/docker-images`
   (`Dockerfile`, section "Node and Chromium" of its AGENTS.md). When that recipe changes its
   packages, change this one the same way.
 
 ## Workflow
 
-- **Schedules.** `17 */4 * * *` builds a PHP version only when its base digest differs from the
-  annotation on any of its three tags (or a tag does not exist). `45 2 * * *` builds every version,
-  for the Debian updates, Node and Composer. The plan job tells the two apart by
-  `github.event.schedule`, compared with `FULL_CRON`. Change both strings together.
+- **Schedule.** `17 */4 * * *` builds every version that is not past its `eol`. Without a new input,
+  every build is a cache hit with the same digest, so the tags do not move (see **Build cache**).
+  There used to be a second, daily schedule and a base-digest check for the 4-hourly one. Both
+  existed only because a build without a cache was expensive and changed every layer
 - **Push to `main`** that touches the Dockerfile, `versions.json`, the tests or the workflow builds
   everything. **Manual run**: everything, or one PHP version (`php` input), which also bypasses the
   EOL filter for a critical fix.
@@ -77,6 +76,39 @@ server, and the secrets reach the container at run time. The image is public.
   three tries. `docker/login-action` cannot retry, and one failed login fails a platform, which
   fails the merge of that version.
 - **Actions are pinned by commit SHA**, with the version in a comment. Dependabot updates them.
+
+## Build cache
+
+A rebuild without a cache writes different layers for the same content: file times, apt logs and
+dates inside files change with every build. A test showed it: a fresh build of the same recipe from
+the same base had four different layer digests out of four. Every server would then download about
+175 MB again on its next deploy, every day, for nothing.
+
+So every build reads its cache from the published tag (`--cache-from type=registry`) and writes its
+cache into the image (`--cache-to type=inline`). A cache hit reuses the published layer byte for
+byte. Two more settings make the whole image digest the same, so a run with no new input moves no
+tag and adds no package version:
+
+- `SOURCE_DATE_EPOCH` is the time of the commit (computed in the plan job). BuildKit writes it as the
+  creation time of the image, which would otherwise be the build time. A test with two fresh
+  builders and the same cache gave the same image digest twice
+- `--provenance=false`. The provenance attestation holds the build times and an invocation id, so
+  it would change the digest of every build. It also put an `unknown/unknown` manifest into each
+  index
+
+- `ARG REFRESH` is at the top of the `common` stage. A declared ARG is part of the cache key of
+  every `RUN` after it, so a new value builds the extensions and the tools layer again. The workflow
+  passes the ISO week (`2026-W40`), computed once in the plan job. **Debian updates of the packages
+  that this image adds therefore arrive within a week.** The base image's own updates arrive within
+  4 hours, through the base digest. A faster `REFRESH` (the date) makes every server download the
+  image again every day
+- Inputs that invalidate layers, as they must: the base digest, the digest of `node:24-trixie-slim`
+  (it changes with Node releases and with Debian updates of that image), the `composer:latest`
+  digest, the Dockerfile, and `REFRESH`
+- The inline cache carries only the layers of the final image (mode `min`). That is enough here: the
+  `node` stage is a pulled image, not a built one, and `common` is part of every final image
+- The three engine builds of one job share the job's builder, which is how they share `common`
+  within one run. The cache from the registry is what carries it from one run to the next
 
 ## Keepalive
 

@@ -20,6 +20,15 @@ FROM node:24-trixie-slim AS node
 
 FROM ${BASE_IMAGE} AS common
 
+# Part of the cache key of every RUN below. The workflow passes the ISO week
+# (2026-W40), so `apt-get upgrade` and the PECL extensions are built again once
+# a week. Within the week a build is a cache hit of the published image, which
+# reuses its layers byte for byte, so a server that deploys after a rebuild
+# downloads nothing new. A rebuild without the cache writes different layers
+# for the same content (file times, apt logs), and every server would download
+# them again.
+ARG REFRESH=local
+
 LABEL org.opencontainers.image.source="https://github.com/MahoCommerce/mahocloud-docker-images" \
       org.opencontainers.image.description="PHP image of the Maho Cloud servers"
 

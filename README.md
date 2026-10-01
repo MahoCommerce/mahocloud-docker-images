@@ -29,8 +29,9 @@ Every tag is available for `linux/amd64` and `linux/arm64`.
 
 ## Rebuilds
 
-- Every 4 hours, the workflow rebuilds a PHP version when its FrankenPHP base image has a new digest.
-- Every day, the workflow rebuilds all PHP versions. This adds the Debian security updates, Node and Composer.
+- Every 4 hours, the workflow builds all PHP versions. A new FrankenPHP base, Node or Composer release gives a new image.
+- Once a week, the build runs `apt-get upgrade` and gets the PHP extensions from PECL again.
+- When no input changed, the build gives the same image digest, so the tag does not move and a server downloads nothing.
 - A PHP version stops being rebuilt after its end of life (`eol` in `versions.json`). Its tags stay available.
 
 Each image passes `tests/image.sh` before its tag moves. If a build or a test fails, the tag stays on the last good image.

@@ -2,11 +2,10 @@ name: Build
 
 on:
   schedule:
-    # Every 4 hours: rebuild a PHP version whose FrankenPHP base has a new digest.
+    # Every 4 hours, everything. A build with no new input (base, Node, Composer,
+    # Dockerfile, REFRESH week) is a cache hit and gives the same digest, so the
+    # tags do not move. See "Build cache" in AGENTS.md.
     - cron: '17 */4 * * *'
-    # Daily: rebuild everything, for the Debian updates, Node and Composer, which
-    # change without a new FrankenPHP digest. Keep this string equal to FULL_CRON.
-    - cron: '45 2 * * *'
   push:
     branches: [main]
     paths:
@@ -24,7 +23,7 @@ on:
 permissions:
   contents: read
 
-# A daily run and a 4-hourly run can meet. The second one waits.
+# A scheduled run and a push can meet. The second one waits.
 concurrency:
   group: build
   cancel-in-progress: false
@@ -32,7 +31,6 @@ concurrency:
 env:
   IMAGE: ghcr.io/mahocommerce/mahocloud-php
   ENGINES: mysql pgsql sqlite
-  FULL_CRON: '45 2 * * *'
 
 jobs:
   # GitHub disables the schedule of a public repository after 60 days without
@@ -55,6 +53,8 @@ jobs:
       build: ${{ steps.plan.outputs.build }}
       merge: ${{ steps.plan.outputs.merge }}
       has_builds: ${{ steps.plan.outputs.has_builds }}
+      refresh: ${{ steps.plan.outputs.refresh }}
+      epoch: ${{ steps.plan.outputs.epoch }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,8 +64,6 @@ jobs:
         env:
           # Through env, not ${{ }} in the script, which the shell would evaluate.
           INPUT_PHP: ${{ inputs.php }}
-          EVENT_NAME: ${{ github.event_name }}
-          SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
           today=$(date -u +%F)
@@ -85,39 +83,16 @@ jobs:
             rows=$(jq -c --arg d "$today" '[.[] | select(.eol >= $d)]' versions.json)
           fi
 
-          full=false
-          if [ "$EVENT_NAME" != "schedule" ] || [ "$SCHEDULE" = "$FULL_CRON" ]; then
-            full=true
-          fi
-
+          # The base is resolved to a digest once, here, so both platforms build
+          # from the same base and the image records it.
           selected='[]'
           for php in $(jq -r '.[].php' <<< "$rows"); do
             base_name="dunglas/frankenphp:1-php${php}-trixie"
             manifest=$(docker buildx imagetools inspect "$base_name" --format '{{json .Manifest}}')
             base_digest=$(jq -r '.digest' <<< "$manifest")
-
-            reason=""
-            if [ "$full" = "true" ]; then
-              reason="full rebuild"
-            else
-              for engine in $ENGINES; do
-                # A tag that does not exist yet reads as an empty digest.
-                raw=$(docker buildx imagetools inspect "${IMAGE}:${php}-${engine}" --raw 2>/dev/null) || raw='{}'
-                published=$(jq -r '.annotations["org.opencontainers.image.base.digest"] // ""' <<< "$raw")
-                if [ "$published" != "$base_digest" ]; then
-                  reason="${php}-${engine} was built from ${published:-nothing}"
-                  break
-                fi
-              done
-            fi
-
-            if [ -n "$reason" ]; then
-              echo "PHP $php: build ($reason, base $base_digest)"
-              selected=$(jq -c --arg php "$php" --arg name "$base_name" --arg digest "$base_digest" \
-                '. + [{php: $php, base_name: $name, base_digest: $digest}]' <<< "$selected")
-            else
-              echo "PHP $php: up to date (base $base_digest)"
-            fi
+            echo "PHP $php: base $base_digest"
+            selected=$(jq -c --arg php "$php" --arg name "$base_name" --arg digest "$base_digest" \
+              '. + [{php: $php, base_name: $name, base_digest: $digest}]' <<< "$selected")
           done
 
           # Each version builds once per platform on a native runner. QEMU would
@@ -127,7 +102,13 @@ jobs:
                {platform: "linux/arm64", runner: "ubuntu-24.04-arm"}][]
             | $e + .]' <<< "$selected")
 
+          # Computed once here, so both platforms of a run get the same values.
+          # REFRESH is the ISO week. The epoch is the commit time: it becomes the
+          # creation time of the image, which would otherwise be the build time
+          # and change the digest of every build.
           {
+            echo "refresh=$(date -u +%G-W%V)"
+            echo "epoch=$(git log -1 --format=%ct)"
             echo "build={\"include\":$build}"
             echo "merge={\"include\":$selected}"
             echo "has_builds=$([ "$(jq length <<< "$selected")" != "0" ] && echo true || echo false)"
@@ -174,17 +155,23 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # The three engines build one after the other in the same builder, so the
-      # second and third reuse the common stage of the first. The builder is new
-      # in every job and exports no cache, so `apt-get upgrade` always runs on a
-      # fresh layer. Each image is tested before its digest is kept: a failure
-      # stops the job, the merge refuses an incomplete set, and the published
-      # tag stays on the last good image.
+      # second and third reuse the common stage of the first. Each build reads
+      # its cache from the published tag and writes the cache into the image
+      # (inline). Within one REFRESH week, a build with the same base, Node and
+      # Composer is a cache hit and reuses the published layers byte for byte.
+      # With the creation time fixed and no attestation, it also gives the same
+      # image digest, so the tag does not move. See "Build cache" in AGENTS.md.
+      # Each image is tested before its digest is kept: a failure stops the job,
+      # the merge refuses an incomplete set, and the published tag stays on the
+      # last good image.
       - name: Build, push by digest and test
         env:
           PHP: ${{ matrix.php }}
           PLATFORM: ${{ matrix.platform }}
           BASE_NAME: ${{ matrix.base_name }}
           BASE_DIGEST: ${{ matrix.base_digest }}
+          REFRESH: ${{ needs.plan.outputs.refresh }}
+          SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.epoch }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/digests"
@@ -196,6 +183,11 @@ jobs:
               --pull \
               --build-arg "PHP_VERSION=$PHP" \
               --build-arg "BASE_IMAGE=$BASE_NAME@$BASE_DIGEST" \
+              --build-arg "REFRESH=$REFRESH" \
+              --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+              --provenance=false \
+              --cache-from "type=registry,ref=$IMAGE:$PHP-$engine" \
+              --cache-to type=inline \
               --label "org.opencontainers.image.base.name=docker.io/$BASE_NAME" \
               --label "org.opencontainers.image.base.digest=$BASE_DIGEST" \
               --label "org.opencontainers.image.revision=$GITHUB_SHA" \
@@ -257,8 +249,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # The base digest goes onto the index as an annotation. The plan job of the
-      # 4-hourly run reads it back to decide whether the base changed.
+      # The base digest goes onto the index as an annotation, for inspection. With
+      # the same platform digests and the same base, the index is the same too.
       - name: Create the manifest lists and push
         working-directory: ${{ runner.temp }}/digests
         env:
