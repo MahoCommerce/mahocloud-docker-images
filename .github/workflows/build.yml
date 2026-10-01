@@ -1,0 +1,282 @@
+name: Build
+
+on:
+  schedule:
+    # Every 4 hours: rebuild a PHP version whose FrankenPHP base has a new digest.
+    - cron: '17 */4 * * *'
+    # Daily: rebuild everything, for the Debian updates, Node and Composer, which
+    # change without a new FrankenPHP digest. Keep this string equal to FULL_CRON.
+    - cron: '45 2 * * *'
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - versions.json
+      - tests/**
+      - .github/workflows/build.yml
+  workflow_dispatch:
+    inputs:
+      php:
+        description: 'One PHP version to build (empty: all that are not EOL)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# A daily run and a 4-hourly run can meet. The second one waits.
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/mahocommerce/mahocloud-php
+  ENGINES: mysql pgsql sqlite
+  FULL_CRON: '45 2 * * *'
+
+jobs:
+  # GitHub disables the schedule of a public repository after 60 days without
+  # activity, silently. A call to the enable endpoint resets that counter, so
+  # every scheduled run makes one. See "Keepalive" in AGENTS.md.
+  keepalive:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Reset the inactivity counter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable"
+
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      merge: ${{ steps.plan.outputs.merge }}
+      has_builds: ${{ steps.plan.outputs.has_builds }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Choose the PHP versions to build
+        id: plan
+        env:
+          # Through env, not ${{ }} in the script, which the shell would evaluate.
+          INPUT_PHP: ${{ inputs.php }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+
+          if [ -n "$INPUT_PHP" ]; then
+            # An explicit version bypasses the EOL filter, for a critical fix.
+            rows=$(jq -c --arg p "$INPUT_PHP" '[.[] | select(.php == $p)]' versions.json)
+            if [ "$(jq length <<< "$rows")" = "0" ]; then
+              echo "Unknown PHP version: $INPUT_PHP" >&2
+              exit 1
+            fi
+          else
+            expired=$(jq -r --arg d "$today" '[.[] | select(.eol < $d) | "\(.php) (EOL \(.eol))"] | join(", ")' versions.json)
+            if [ -n "$expired" ]; then
+              echo "::notice title=EOL PHP versions skipped::$expired"
+            fi
+            rows=$(jq -c --arg d "$today" '[.[] | select(.eol >= $d)]' versions.json)
+          fi
+
+          full=false
+          if [ "$EVENT_NAME" != "schedule" ] || [ "$SCHEDULE" = "$FULL_CRON" ]; then
+            full=true
+          fi
+
+          selected='[]'
+          for php in $(jq -r '.[].php' <<< "$rows"); do
+            base_name="dunglas/frankenphp:1-php${php}-trixie"
+            manifest=$(docker buildx imagetools inspect "$base_name" --format '{{json .Manifest}}')
+            base_digest=$(jq -r '.digest' <<< "$manifest")
+
+            reason=""
+            if [ "$full" = "true" ]; then
+              reason="full rebuild"
+            else
+              for engine in $ENGINES; do
+                # A tag that does not exist yet reads as an empty digest.
+                raw=$(docker buildx imagetools inspect "${IMAGE}:${php}-${engine}" --raw 2>/dev/null) || raw='{}'
+                published=$(jq -r '.annotations["org.opencontainers.image.base.digest"] // ""' <<< "$raw")
+                if [ "$published" != "$base_digest" ]; then
+                  reason="${php}-${engine} was built from ${published:-nothing}"
+                  break
+                fi
+              done
+            fi
+
+            if [ -n "$reason" ]; then
+              echo "PHP $php: build ($reason, base $base_digest)"
+              selected=$(jq -c --arg php "$php" --arg name "$base_name" --arg digest "$base_digest" \
+                '. + [{php: $php, base_name: $name, base_digest: $digest}]' <<< "$selected")
+            else
+              echo "PHP $php: up to date (base $base_digest)"
+            fi
+          done
+
+          # Each version builds once per platform on a native runner. QEMU would
+          # compile the extensions under emulation, many times slower.
+          build=$(jq -c '[.[] | . as $e
+            | [{platform: "linux/amd64", runner: "ubuntu-latest"},
+               {platform: "linux/arm64", runner: "ubuntu-24.04-arm"}][]
+            | $e + .]' <<< "$selected")
+
+          {
+            echo "build={\"include\":$build}"
+            echo "merge={\"include\":$selected}"
+            echo "has_builds=$([ "$(jq length <<< "$selected")" != "0" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: PHP ${{ matrix.php }} (${{ matrix.platform }})
+    needs: plan
+    if: ${{ needs.plan.outputs.has_builds == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.build) }}
+      fail-fast: false
+    steps:
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Hand-rolled rather than docker/login-action, which cannot retry.
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            if printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin; then
+              exit 0
+            fi
+            echo "::warning::docker login failed (attempt $attempt/3)"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 10))
+            fi
+          done
+          echo "::error::docker login failed after 3 attempts"
+          exit 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # The three engines build one after the other in the same builder, so the
+      # second and third reuse the common stage of the first. The builder is new
+      # in every job and exports no cache, so `apt-get upgrade` always runs on a
+      # fresh layer. Each image is tested before its digest is kept: a failure
+      # stops the job, the merge refuses an incomplete set, and the published
+      # tag stays on the last good image.
+      - name: Build, push by digest and test
+        env:
+          PHP: ${{ matrix.php }}
+          PLATFORM: ${{ matrix.platform }}
+          BASE_NAME: ${{ matrix.base_name }}
+          BASE_DIGEST: ${{ matrix.base_digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          for engine in $ENGINES; do
+            echo "::group::Build $PHP-$engine ($PLATFORM)"
+            docker buildx build \
+              --platform "$PLATFORM" \
+              --target "$engine" \
+              --pull \
+              --build-arg "PHP_VERSION=$PHP" \
+              --build-arg "BASE_IMAGE=$BASE_NAME@$BASE_DIGEST" \
+              --label "org.opencontainers.image.base.name=docker.io/$BASE_NAME" \
+              --label "org.opencontainers.image.base.digest=$BASE_DIGEST" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file "$RUNNER_TEMP/$engine.json" \
+              .
+            echo "::endgroup::"
+
+            digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/$engine.json")
+            ./tests/image.sh "$IMAGE@$digest" "$engine"
+
+            mkdir -p "$RUNNER_TEMP/digests/$engine"
+            touch "$RUNNER_TEMP/digests/$engine/${digest#sha256:}"
+          done
+
+      - name: Upload digests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.php }}-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: PHP ${{ matrix.php }}
+    needs: [plan, build]
+    if: ${{ always() && needs.plan.outputs.has_builds == 'true' && needs.build.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.merge) }}
+      fail-fast: false
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.php }}-linux-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            if printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin; then
+              exit 0
+            fi
+            echo "::warning::docker login failed (attempt $attempt/3)"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 10))
+            fi
+          done
+          echo "::error::docker login failed after 3 attempts"
+          exit 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # The base digest goes onto the index as an annotation. The plan job of the
+      # 4-hourly run reads it back to decide whether the base changed.
+      - name: Create the manifest lists and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          PHP: ${{ matrix.php }}
+          BASE_DIGEST: ${{ matrix.base_digest }}
+        run: |
+          set -euo pipefail
+          for engine in $ENGINES; do
+            # Refuse a one-platform manifest when a platform build failed.
+            count=$(find "$engine" -type f 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$count" -ne 2 ]; then
+              echo "Expected 2 platform digests for $PHP-$engine, found $count" >&2
+              exit 1
+            fi
+            # shellcheck disable=SC2046 # one argument per digest
+            docker buildx imagetools create -t "$IMAGE:$PHP-$engine" \
+              --annotation "index:org.opencontainers.image.base.digest=$BASE_DIGEST" \
+              --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              $(cd "$engine" && printf "$IMAGE@sha256:%s " *)
+            docker buildx imagetools inspect "$IMAGE:$PHP-$engine"
+          done
