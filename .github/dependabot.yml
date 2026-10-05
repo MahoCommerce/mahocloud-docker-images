@@ -10,11 +10,3 @@ updates:
       all-dependencies:
         patterns:
           - "*"
-  # Bumps the literal `node:24-trixie-slim`. A new Node major is a decision for a
-  # person: the accessibility scanner of Maho needs Node 20 or later.
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
