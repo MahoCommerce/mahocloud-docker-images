@@ -16,7 +16,7 @@ ARG PHP_VERSION=8.5
 # exactly the base it was built from. A local `docker build` uses the tag.
 ARG BASE_IMAGE=dunglas/frankenphp:1-php${PHP_VERSION}-trixie
 
-FROM node:24-trixie-slim AS node
+FROM node:26-trixie-slim AS node
 
 FROM ${BASE_IMAGE} AS common
 
