@@ -16,7 +16,10 @@ ARG PHP_VERSION=8.5
 # exactly the base it was built from. A local `docker build` uses the tag.
 ARG BASE_IMAGE=dunglas/frankenphp:1-php${PHP_VERSION}-trixie
 
-FROM node:24-trixie-slim AS node
+# One Node major for every website, whatever its Maho version: this image has
+# no tag per Maho version. It is the major of the newest Maho generation in
+# MahoCommerce/docker-images. See "Node major" in AGENTS.md.
+FROM node:26-trixie-slim AS node
 
 FROM ${BASE_IMAGE} AS common
 
