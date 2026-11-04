@@ -57,6 +57,13 @@ server, and the secrets reach the container at run time. The image is public.
 - The Node, Chromium and Mesa stub recipe is the same as in `MahoCommerce/docker-images`
   (`Dockerfile`, section "Node and Chromium" of its AGENTS.md). When that recipe changes its
   packages, change this one the same way.
+- **Node major.** `MahoCommerce/docker-images` sets the Node major per Maho version (24 on 26.9.x,
+  26 from 26.11), so a released tag keeps its major. This image has no tag per Maho version, so one
+  major serves every website, also the ones on Maho 26.9. It is the major of the newest Maho
+  generation there (`FROM node:26-trixie-slim`). A new major reaches every website in one night,
+  through the image update in the maintenance window. Before you change it, build the image, launch
+  Playwright's Chromium with the Playwright version of each supported Maho release, and run one
+  `npm` build of a real site
 
 ## Workflow
 
@@ -102,7 +109,7 @@ tag and adds no package version:
   that this image adds therefore arrive within a week.** The base image's own updates arrive within
   4 hours, through the base digest. A faster `REFRESH` (the date) makes every server download the
   image again every day
-- Inputs that invalidate layers, as they must: the base digest, the digest of `node:24-trixie-slim`
+- Inputs that invalidate layers, as they must: the base digest, the digest of `node:26-trixie-slim`
   (it changes with Node releases and with Debian updates of that image), the `composer:latest`
   digest, the Dockerfile, and `REFRESH`
 - The inline cache carries only the layers of the final image (mode `min`). That is enough here: the
